@@ -10,7 +10,7 @@ const menuItemStyle = {
   whiteSpace: "nowrap"
 };
 
-function FolderNode({ name, handle, openFile, currentFile }) {
+function FolderNode({ name, handle, openFile, currentFile, setMenu }) {
 
   const [open, setOpen] = useState(true);
   const [children, setChildren] = useState([]);
@@ -66,6 +66,7 @@ function FolderNode({ name, handle, openFile, currentFile }) {
                 handle={item}
                 openFile={openFile}
                 currentFile={currentFile}
+                setMenu={setMenu}
               />
 
             ) : (
@@ -77,6 +78,15 @@ function FolderNode({ name, handle, openFile, currentFile }) {
                   (currentFile === item.name ? "active" : "")
                 }
                 onClick={() => openFile(item.name)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setMenu({
+                    visible: true,
+                    x: e.clientX,
+                    y: e.clientY,
+                    file: item.name
+                  });
+                }}
               >
 
                 📄 {item.name}
@@ -386,6 +396,21 @@ function App() {
     };
 
   }, [code, currentFile, directoryHandle]);
+
+  /* ================= CLOSE MENU ON CLICK ================= */
+
+  useEffect(() => {
+
+    const close = () => {
+      setMenu({ visible: false });
+    };
+
+    window.addEventListener("click", close);
+
+    return () => window.removeEventListener("click", close);
+
+  }, []);
+
   /* ================= AUTO SAVE ================= */
 
   useEffect(() => {
@@ -685,6 +710,7 @@ function App() {
               handle={directoryHandle}
               openFile={openFile}
               currentFile={currentFile}
+              setMenu={setMenu}
             />
           </div>
         )}
