@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Editor from "@monaco-editor/react";
 import axios from "axios";
+import io from "socket.io-client";
 
 
 const menuItemStyle = {
@@ -119,6 +120,14 @@ function App() {
   const [files, setFiles] = useState([]);
   const [currentFile, setCurrentFile] = useState(null);
 
+  // Collaboration states
+  const [sessionId, setSessionId] = useState(null);
+  const [shareUrl, setShareUrl] = useState("");
+  const [isCollaborating, setIsCollaborating] = useState(false);
+  const socketRef = useRef(null);
+  const isRemoteUpdate = useRef(false);
+  const sessionFilesRef = useRef({}); // Store session files for collaborators
+
   /* ================= CONTEXT MENU ================= */
 
   const [menu, setMenu] = useState({
@@ -128,10 +137,204 @@ function App() {
     file: null
   });
 
+  /* ================= COLLABORATION - SETUP SOCKET ================= */
+
+  useEffect(() => {
+    console.log("Setting up socket connection...");
+    
+    // Prevent multiple connections
+    if (socketRef.current?.connected) {
+      console.log("Socket already connected, skipping setup");
+      return;
+    }
+    
+    socketRef.current = io("http://localhost:7009");
+    
+    socketRef.current.on("connect", () => {
+      console.log("Socket connected!");
+      
+      // Check if there's a session in URL after connection
+      const params = new URLSearchParams(window.location.search);
+      const session = params.get("session");
+      
+      if (session) {
+        console.log("Auto-joining session from URL:", session);
+        socketRef.current.emit("join_session", { session_id: session });
+      }
+    });
+    
+    socketRef.current.on("session_joined", (data) => {
+      console.log("=== SESSION JOINED ===");
+      console.log("Session ID:", data.session_id);
+      console.log("Files received:", data.files);
+      console.log("File names:", Object.keys(data.files));
+      
+      setIsCollaborating(true);
+      setSessionId(data.session_id);
+      
+      // Store all files in ref for collaborators
+      sessionFilesRef.current = data.files;
+      
+      // Get all file names
+      const fileList = Object.keys(data.files);
+      setFiles(fileList);
+      
+      console.log("Files set to state:", fileList);
+      
+      // Open the same file the owner has open
+      const fileToOpen = data.current_file || fileList[0];
+      console.log("Opening file:", fileToOpen);
+      
+      if (fileToOpen && data.files[fileToOpen] !== undefined) {
+        setCurrentFile(fileToOpen);
+        setCode(data.files[fileToOpen]);
+        console.log("File opened successfully. Content length:", data.files[fileToOpen].length);
+      } else {
+        console.error("File not found:", fileToOpen);
+      }
+      
+      // Create a simple virtual directory handle for collaborators
+      setDirectoryHandle({
+        name: data.folder_name || "Shared Workspace",
+        kind: "directory",
+        isVirtual: true,
+        values: async function* () {
+          console.log("Generating virtual directory entries");
+          for (const filename of fileList) {
+            console.log("Yielding file:", filename);
+            yield {
+              name: filename,
+              kind: "file"
+            };
+          }
+        }
+      });
+      
+      setOutput(`✅ Joined collaboration session: ${data.session_id}\n\n📝 You can now edit files in real-time!\nChanges will sync to all participants.`);
+    });
+    
+    socketRef.current.on("error", (data) => {
+      console.error("Socket error:", data);
+      setError(`❌ ${data.message}`);
+    });
+    
+    socketRef.current.on("code_update", (data) => {
+      console.log("Received code update:", data.filename, "Content length:", data.content.length);
+      
+      // Update session files
+      sessionFilesRef.current[data.filename] = data.content;
+      
+      if (data.filename === currentFile) {
+        isRemoteUpdate.current = true;
+        setCode(data.content);
+        
+        // If we have directory handle (owner), save the changes IMMEDIATELY
+        if (directoryHandle && !directoryHandle.isVirtual) {
+          console.log("Owner saving collaborator's changes to disk");
+          saveFileContent(data.filename, data.content);
+        }
+      }
+      
+      // Update in-memory files for collaborators
+      setFiles(prevFiles => {
+        if (!prevFiles.includes(data.filename)) {
+          return [...prevFiles, data.filename];
+        }
+        return prevFiles;
+      });
+    });
+    
+    socketRef.current.on("user_joined", () => {
+      setOutput("👤 A user joined the session");
+    });
+    
+    socketRef.current.on("user_left", () => {
+      setOutput("👤 A user left the session");
+    });
+    
+    socketRef.current.on("file_created", (data) => {
+      setFiles(prevFiles => {
+        if (!prevFiles.includes(data.filename)) {
+          return [...prevFiles, data.filename];
+        }
+        return prevFiles;
+      });
+      setOutput(`📄 ${data.filename} was created`);
+    });
+    
+    socketRef.current.on("file_deleted", (data) => {
+      setFiles(prevFiles => prevFiles.filter(f => f !== data.filename));
+      if (currentFile === data.filename) {
+        setCurrentFile(null);
+        setCode("");
+      }
+      setOutput(`🗑️ ${data.filename} was deleted`);
+    });
+    
+    socketRef.current.on("file_renamed", (data) => {
+      setFiles(prevFiles => 
+        prevFiles.map(f => f === data.oldName ? data.newName : f)
+      );
+      if (currentFile === data.oldName) {
+        setCurrentFile(data.newName);
+      }
+      setOutput(`✏️ ${data.oldName} renamed to ${data.newName}`);
+    });
+    
+    socketRef.current.on("file_switched", (data) => {
+      // Update session files
+      sessionFilesRef.current[data.filename] = data.content;
+      
+      // When owner switches files, collaborators follow
+      setCurrentFile(data.filename);
+      setCode(data.content);
+      setOutput(`📄 Owner opened ${data.filename}`);
+    });
+    
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, []); // Empty dependency array - only run once on mount
+
+  /* ================= COLLABORATION - SYNC CODE CHANGES ================= */
+
+  useEffect(() => {
+    if (isCollaborating && sessionId && currentFile && !isRemoteUpdate.current) {
+      const timer = setTimeout(() => {
+        console.log("Sending code change:", currentFile, code.substring(0, 50));
+        socketRef.current?.emit("code_change", {
+          session_id: sessionId,
+          filename: currentFile,
+          content: code
+        });
+        
+        // Also save to local file if we have directory handle (owner only)
+        if (directoryHandle && !directoryHandle.isVirtual) {
+          saveFile();
+        }
+      }, 500);
+      
+      return () => clearTimeout(timer);
+    }
+    
+    isRemoteUpdate.current = false;
+  }, [code, isCollaborating, sessionId, currentFile]);
+
   /* ================= RESTORE FOLDER PERMISSION ================= */
 
   useEffect(() => {
 
+    // Don't restore if there's a session in URL (collaborator joining)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("session")) {
+      return;
+    }
+
+    // DISABLED: Auto-restore feature
+    // Uncomment below to enable auto-restore of last opened folder
+    /*
     const restore = async () => {
 
       const req = indexedDB.open("fs-db", 1);
@@ -178,9 +381,123 @@ function App() {
     };
 
     restore();
+    */
 
   }, []);
 
+
+  /* ================= COLLABORATION - CREATE SESSION ================= */
+
+  const createSession = async () => {
+    try {
+      if (!directoryHandle) {
+        setError("❌ Open a folder first");
+        return;
+      }
+      
+      // Collect all files recursively with full paths
+      const filesData = {};
+      const folderStructure = [];
+      
+      const collectFiles = async (handle, path = "") => {
+        for await (const entry of handle.values()) {
+          const fullPath = path ? `${path}/${entry.name}` : entry.name;
+          
+          if (entry.kind === "file") {
+            try {
+              const file = await entry.getFile();
+              const content = await file.text();
+              // Store with just filename for flat structure, or fullPath for nested
+              const key = entry.name; // Use just filename for now
+              filesData[key] = content;
+              folderStructure.push({ name: key, type: "file" });
+              console.log("Added file:", key, "Content length:", content.length);
+            } catch (e) {
+              console.error("Error reading file:", fullPath, e);
+            }
+          } else if (entry.kind === "directory") {
+            folderStructure.push({ name: fullPath, type: "directory" });
+            await collectFiles(entry, fullPath);
+          }
+        }
+      };
+      
+      await collectFiles(directoryHandle);
+      
+      console.log("Total files collected:", Object.keys(filesData).length);
+      console.log("Files:", Object.keys(filesData));
+      
+      const res = await axios.post("http://localhost:7009/api/session/create", {
+        files: filesData,
+        folder_structure: folderStructure,
+        folder_name: directoryHandle.name,
+        current_file: currentFile
+      });
+      
+      setSessionId(res.data.session_id);
+      setShareUrl(res.data.share_url);
+      setIsCollaborating(true);
+      
+      // Join the session
+      socketRef.current?.emit("join_session", {
+        session_id: res.data.session_id
+      });
+      
+      setOutput(`✅ Session created! Share this URL:\n${res.data.share_url}`);
+      
+      // Copy to clipboard
+      navigator.clipboard.writeText(res.data.share_url);
+      
+      // Show notification
+      setTimeout(() => {
+        setOutput(`📋 Share URL copied to clipboard!\n${res.data.share_url}\n\nAnyone with this link can view and edit your files in real-time.`);
+      }, 100);
+      
+    } catch (e) {
+      setError("❌ Failed to create session");
+      console.error(e);
+    }
+  };
+
+  /* ================= COLLABORATION - JOIN SESSION ================= */
+
+  const joinSession = (session_id) => {
+    socketRef.current?.emit("join_session", { session_id });
+  };
+
+  /* ================= COLLABORATION - STOP SESSION ================= */
+
+  const stopSession = () => {
+    if (socketRef.current && sessionId) {
+      socketRef.current.emit("leave_session", { session_id: sessionId });
+    }
+    setIsCollaborating(false);
+    setSessionId(null);
+    setShareUrl("");
+    setOutput("❌ Collaboration stopped");
+  };
+
+  /* ================= CLEAR WORKSPACE ================= */
+
+  const clearWorkspace = async () => {
+    // Clear IndexedDB
+    const req = indexedDB.open("fs-db", 1);
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction("handles", "readwrite");
+      tx.objectStore("handles").clear();
+    };
+    
+    // Clear state
+    setDirectoryHandle(null);
+    setFiles([]);
+    setCurrentFile(null);
+    setCode("// Write code here");
+    setIsCollaborating(false);
+    setSessionId(null);
+    setShareUrl("");
+    setOutput("🔄 Workspace cleared");
+  };
 
   /* ================= OPEN FOLDER ================= */
 
@@ -268,25 +585,80 @@ function App() {
 
   /* ================= OPEN FILE ================= */
 
+  /* ================= OPEN FILE ================= */
+
   const openFile = async (name) => {
+    console.log("=== OPEN FILE CALLED ===");
+    console.log("File name:", name);
+    console.log("Current file:", currentFile);
+    console.log("Directory handle exists:", !!directoryHandle);
+    console.log("Is virtual:", directoryHandle?.isVirtual);
+    console.log("Is collaborating:", isCollaborating);
+    console.log("Session files:", Object.keys(sessionFilesRef.current));
+    
     try {
-      if (!directoryHandle) return;
+      // For collaborators (virtual directory)
+      if (directoryHandle && directoryHandle.isVirtual) {
+        console.log(">>> Collaborator path");
+        const content = sessionFilesRef.current[name];
+        console.log("File found in session:", content !== undefined);
+        console.log("Content length:", content?.length);
+        
+        if (content !== undefined) {
+          console.log("Setting state...");
+          setCurrentFile(name);
+          setCode(content);
+          setOutput(`📄 Opened ${name}`);
+          setError("");
+          console.log("✅ File opened successfully!");
+          return;
+        } else {
+          const error = `File ${name} not found. Available: ${Object.keys(sessionFilesRef.current).join(', ')}`;
+          console.error("❌", error);
+          setError(`❌ ${error}`);
+          return;
+        }
+      }
+      
+      // For owner (real directory)
+      if (!directoryHandle) {
+        console.error("❌ No directory handle");
+        setError("❌ No directory handle");
+        return;
+      }
 
-      const fileHandle =
-        await directoryHandle.getFileHandle(name);
-
+      console.log(">>> Owner path");
+      console.log("Getting file handle for:", name);
+      
+      const fileHandle = await directoryHandle.getFileHandle(name);
+      console.log("File handle obtained");
+      
       const file = await fileHandle.getFile();
-
+      console.log("File object obtained, size:", file.size);
+      
       const text = await file.text();
-
+      console.log("File read successfully, length:", text.length);
+      
       setCurrentFile(name);
       setCode(text);
-
       setOutput(`📄 Opened ${name}`);
       setError("");
+      console.log("✅ File opened successfully!");
 
-    } catch {
-      setError("❌ Cannot open file");
+      // Notify collaborators when owner switches files
+      if (isCollaborating && sessionId) {
+        console.log("Notifying collaborators...");
+        socketRef.current?.emit("file_switched", {
+          session_id: sessionId,
+          filename: name,
+          content: text
+        });
+      }
+
+    } catch (e) {
+      console.error("❌ Error opening file:", e);
+      console.error("Error details:", e.message, e.stack);
+      setError(`❌ Cannot open file: ${e.message}`);
     }
   };
 
@@ -295,24 +667,67 @@ function App() {
 
   const saveFile = async () => {
     try {
-      if (!directoryHandle || !currentFile) return;
+      if (!directoryHandle || !currentFile || directoryHandle.isVirtual) return;
+
+      let fileHandle;
+      
+      // Handle nested paths
+      if (currentFile.includes('/')) {
+        const parts = currentFile.split('/');
+        let currentHandle = directoryHandle;
+        
+        // Navigate through directories
+        for (let i = 0; i < parts.length - 1; i++) {
+          currentHandle = await currentHandle.getDirectoryHandle(parts[i]);
+        }
+        
+        // Get the file
+        fileHandle = await currentHandle.getFileHandle(
+          parts[parts.length - 1],
+          { create: true }
+        );
+      } else {
+        fileHandle = await directoryHandle.getFileHandle(
+          currentFile,
+          { create: true }
+        );
+      }
+
+      const writable = await fileHandle.createWritable();
+      await writable.write(code);
+      await writable.close();
+
+      setError("");
+
+    } catch (e) {
+      console.error("Save failed:", e);
+      // Don't show error for collaborators
+      if (!directoryHandle?.isVirtual) {
+        setError("❌ Save failed");
+      }
+    }
+  };
+
+  /* ================= SAVE FILE CONTENT (HELPER) ================= */
+
+  const saveFileContent = async (filename, content) => {
+    try {
+      if (!directoryHandle) return;
 
       const fileHandle =
         await directoryHandle.getFileHandle(
-          currentFile,
+          filename,
           { create: true }
         );
 
       const writable =
         await fileHandle.createWritable();
 
-      await writable.write(code);
+      await writable.write(content);
       await writable.close();
 
-      setError("");
-
-    } catch {
-      setError("❌ Save failed");
+    } catch (e) {
+      console.error("Failed to save file:", e);
     }
   };
 
@@ -414,16 +829,25 @@ function App() {
   /* ================= AUTO SAVE ================= */
 
   useEffect(() => {
+    console.log("Auto-save check:", { currentFile, hasDirectoryHandle: !!directoryHandle, isVirtual: directoryHandle?.isVirtual });
 
-    if (!currentFile || !directoryHandle) return;
+    if (!currentFile) return;
 
     const timer = setTimeout(() => {
-      saveFile();
+      console.log("Auto-save triggered for:", currentFile);
+      // Only auto-save for owner with real directory handle
+      if (directoryHandle && !directoryHandle.isVirtual) {
+        console.log("Saving to disk...");
+        saveFile();
+      } else {
+        console.log("Skipping save (collaborator or no directory)");
+      }
+      // For collaborators, changes are already synced via socket
     }, 1200); // 1.2 seconds after typing stops
 
     return () => clearTimeout(timer);
 
-  }, [code]);
+  }, [code, currentFile, directoryHandle]);
 
 
   /* ================= OPEN SINGLE FILE ================= */
@@ -495,6 +919,15 @@ function App() {
       setOutput(`✅ Created ${name}`);
       setError("");
 
+      // Broadcast to collaborators
+      if (isCollaborating && sessionId) {
+        socketRef.current?.emit("file_operation", {
+          session_id: sessionId,
+          operation: "create",
+          filename: name
+        });
+      }
+
     } catch {
       setError("❌ File creation failed");
     }
@@ -545,6 +978,16 @@ function App() {
       setOutput(`✏️ Renamed to ${newName}`);
       setError("");
 
+      // Broadcast to collaborators
+      if (isCollaborating && sessionId) {
+        socketRef.current?.emit("file_operation", {
+          session_id: sessionId,
+          operation: "rename",
+          oldName: oldName,
+          newName: newName
+        });
+      }
+
     } catch {
       setError("❌ Rename failed");
     }
@@ -576,6 +1019,15 @@ function App() {
 
       setOutput(`🗑️ Deleted ${name}`);
       setError("");
+
+      // Broadcast to collaborators
+      if (isCollaborating && sessionId) {
+        socketRef.current?.emit("file_operation", {
+          session_id: sessionId,
+          operation: "delete",
+          filename: name
+        });
+      }
 
     } catch {
       setError("❌ Delete failed");
@@ -619,10 +1071,23 @@ function App() {
             letterSpacing: "0.5px",
             color: "#ccc",
             borderBottom: "1px solid #333",
-            textTransform: "uppercase"
+            textTransform: "uppercase",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center"
           }}
         >
-          Explorer
+          <span>Explorer</span>
+          {isCollaborating && (
+            <span style={{ 
+              background: "#0e639c", 
+              padding: "2px 8px", 
+              borderRadius: "3px",
+              fontSize: "10px"
+            }}>
+              🔗 LIVE
+            </span>
+          )}
         </div>
 
         {/* ================= NO FOLDER (WELCOME) ================= */}
@@ -693,6 +1158,74 @@ function App() {
           </div>
         )}
 
+        {/* ================= COLLABORATION CONTROLS ================= */}
+        {directoryHandle && !isCollaborating && (
+          <div style={{ padding: "12px 16px", borderBottom: "1px solid #333" }}>
+            <button
+              onClick={createSession}
+              style={{
+                background: "#0e639c",
+                color: "white",
+                border: "none",
+                padding: "8px 12px",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                width: "100%",
+                fontWeight: "500",
+                marginBottom: "8px"
+              }}
+            >
+              🔗 Share Workspace
+            </button>
+            <button
+              onClick={clearWorkspace}
+              style={{
+                background: "#555",
+                color: "white",
+                border: "none",
+                padding: "8px 12px",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                width: "100%",
+                fontWeight: "500"
+              }}
+            >
+              ✖️ Close Workspace
+            </button>
+          </div>
+        )}
+
+        {isCollaborating && (
+          <div style={{ padding: "12px 16px", borderBottom: "1px solid #333" }}>
+            <div style={{ 
+              fontSize: "11px", 
+              color: "#4ec9b0", 
+              marginBottom: "8px",
+              wordBreak: "break-all"
+            }}>
+              Session: {sessionId}
+            </div>
+            <button
+              onClick={stopSession}
+              style={{
+                background: "#d32f2f",
+                color: "white",
+                border: "none",
+                padding: "8px 12px",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                width: "100%",
+                fontWeight: "500"
+              }}
+            >
+              ❌ Stop Sharing
+            </button>
+          </div>
+        )}
+
 
         {/* ================= FOLDER OPENED ================= */}
         {directoryHandle && (
@@ -704,14 +1237,42 @@ function App() {
               padding: "8px"
             }}
           >
-            {/* ROOT FOLDER */}
-            <FolderNode
-              name={directoryHandle.name}
-              handle={directoryHandle}
-              openFile={openFile}
-              currentFile={currentFile}
-              setMenu={setMenu}
-            />
+            <div>
+              <div style={{ 
+                padding: "6px 8px", 
+                fontSize: "13px", 
+                color: "#ccc",
+                fontWeight: "500"
+              }}>
+                📁 {directoryHandle.name}
+              </div>
+              
+              <div style={{ padding: "8px", color: "#888", fontSize: "11px" }}>
+                Files: {files.length}
+              </div>
+              
+              {files.map((filename) => (
+                <button
+                  key={filename}
+                  onClick={() => openFile(filename)}
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "8px 12px",
+                    margin: "4px 0",
+                    background: currentFile === filename ? "#094771" : "transparent",
+                    color: "white",
+                    border: "1px solid #444",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    fontSize: "13px"
+                  }}
+                >
+                  📄 {filename}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>
